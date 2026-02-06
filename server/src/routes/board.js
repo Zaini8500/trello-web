@@ -5,6 +5,23 @@ const Board = require('../models/Board');
 const List = require('../models/List');
 const Card = require('../models/Card');
 const User = require('../models/User');
+const AuditLog = require('../models/AuditLog');
+
+// Helper function to create audit log
+const createAuditLog = async (action, entityType, entityId, userId, boardId, metadata = {}) => {
+    try {
+        await AuditLog.create({
+            action,
+            entityType,
+            entityId,
+            user: userId,
+            board: boardId,
+            metadata
+        });
+    } catch (error) {
+        console.error('Audit log error:', error);
+    }
+};
 
 // Get all boards for user
 router.get('/', protect, async (req, res) => {
@@ -16,7 +33,6 @@ router.get('/', protect, async (req, res) => {
             ]
         }).populate('owner', 'name email');
 
-        // Map _id to id
         const boardsWithId = boards.map(b => ({
             id: b._id,
             title: b.title,
@@ -39,7 +55,8 @@ router.post('/', protect, async (req, res) => {
             owner: req.user.id
         });
 
-        // No explicit audit log for now to save time/complexity, Mongoose doesn't have it built-in like my custom Prisma model loop.
+        await createAuditLog('create', 'Board', board._id, req.user.id, board._id, { title });
+
         res.json({ id: board._id, title: board.title, owner: req.user.id });
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -65,22 +82,18 @@ router.get('/:id', protect, async (req, res) => {
 
         if (!board) return res.status(404).json({ message: 'Board not found' });
 
-        // Check access
         const isMember = board.members.some(m => m._id.toString() === req.user.id);
         const isOwner = board.owner._id.toString() === req.user.id;
         if (!isMember && !isOwner) return res.status(403).json({ message: 'Not authorized' });
-
-        // Format for frontend
-        // We need to map _id to id for the frontend DND to rely on strings if needed?
-        // Actually DndKit works with strings or numbers.
-        // The previous frontend expects `id` property.
 
         const transformCard = (c) => ({
             id: c._id,
             title: c.title,
             description: c.description,
             order: c.order,
-            listId: c.list
+            listId: c.list,
+            labels: c.labels || [],
+            dueDate: c.dueDate
         });
 
         const transformList = (l) => ({
@@ -118,8 +131,8 @@ router.post('/:id/lists', protect, async (req, res) => {
             order: newOrder
         });
 
-        // Push the list to Board.lists
         await Board.findByIdAndUpdate(boardId, { $push: { lists: list._id } });
+        await createAuditLog('create', 'List', list._id, req.user.id, boardId, { title });
 
         res.json({ id: list._id, title: list.title, order: list.order, boardId });
     } catch (error) {
@@ -127,10 +140,31 @@ router.post('/:id/lists', protect, async (req, res) => {
     }
 });
 
+// Reorder Lists
+router.put('/:id/lists/reorder', protect, async (req, res) => {
+    const { listOrders } = req.body; // Array of { listId, order }
+    const boardId = req.params.id;
+
+    try {
+        const updatePromises = listOrders.map(({ listId, order }) =>
+            List.findByIdAndUpdate(listId, { order }, { new: true })
+        );
+
+        await Promise.all(updatePromises);
+        await createAuditLog('update', 'List', 'multiple', req.user.id, boardId, { action: 'reorder' });
+
+        res.json({ message: 'Lists reordered successfully' });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
 // Create Card
 router.post('/:id/lists/:listId/cards', protect, async (req, res) => {
-    const { title, description } = req.body;
+    const { title, description, labels, dueDate } = req.body;
     const { listId } = req.params;
+    const boardId = req.params.id;
+
     try {
         const lastCard = await Card.findOne({ list: listId }).sort('-order');
         const newOrder = lastCard ? lastCard.order + 100 : 100;
@@ -140,54 +174,70 @@ router.post('/:id/lists/:listId/cards', protect, async (req, res) => {
             description,
             list: listId,
             order: newOrder,
+            labels: labels || [],
+            dueDate: dueDate || null,
             creator: req.user.id
         });
 
-        // Push card to List.cards
         await List.findByIdAndUpdate(listId, { $push: { cards: card._id } });
+        await createAuditLog('create', 'Card', card._id, req.user.id, boardId, { title, listId });
 
         res.json({
             id: card._id,
             title: card.title,
+            description: card.description,
             order: card.order,
-            listId: card.list
+            listId: card.list,
+            labels: card.labels,
+            dueDate: card.dueDate
         });
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
 });
 
-// Update Card (Move, Edit)
+// Update Card
 router.put('/cards/:cardId', protect, async (req, res) => {
-    const { listId, order, title, description } = req.body;
+    const { listId, order, title, description, labels, dueDate } = req.body;
 
     try {
+        const card = await Card.findById(req.params.cardId);
+        if (!card) return res.status(404).json({ message: 'Card not found' });
+
+        const oldListId = card.list.toString();
         const updates = {};
-        if (title) updates.title = title;
-        if (description) updates.description = description;
+
+        if (title !== undefined) updates.title = title;
+        if (description !== undefined) updates.description = description;
         if (order !== undefined) updates.order = order;
+        if (labels !== undefined) updates.labels = labels;
+        if (dueDate !== undefined) updates.dueDate = dueDate;
         if (listId) updates.list = listId;
 
-        const card = await Card.findByIdAndUpdate(req.params.cardId, updates, { new: true });
+        const updatedCard = await Card.findByIdAndUpdate(req.params.cardId, updates, { new: true });
 
-        // If moved list, update references
-        if (listId) {
-            // Removing from old list is hard without knowing old list id.
-            // Or we can just use `cards: cardId` pull.
-            // Actually efficient way: Pull from all lists (expensive) or just find the one.
-            // We can find list which has this card.
-            const oldList = await List.findOne({ cards: card._id });
-            if (oldList && oldList._id.toString() !== listId) {
-                await List.findByIdAndUpdate(oldList._id, { $pull: { cards: card._id } });
-                await List.findByIdAndUpdate(listId, { $push: { cards: card._id } });
-            }
+        if (listId && oldListId !== listId) {
+            await List.findByIdAndUpdate(oldListId, { $pull: { cards: card._id } });
+            await List.findByIdAndUpdate(listId, { $push: { cards: card._id } });
+
+            const list = await List.findById(listId);
+            await createAuditLog('move', 'Card', card._id, req.user.id, list.board, {
+                from: oldListId,
+                to: listId
+            });
+        } else {
+            const list = await List.findById(card.list);
+            await createAuditLog('update', 'Card', card._id, req.user.id, list.board, updates);
         }
 
         res.json({
-            id: card._id,
-            title: card.title,
-            order: card.order,
-            listId: card.list
+            id: updatedCard._id,
+            title: updatedCard.title,
+            description: updatedCard.description,
+            order: updatedCard.order,
+            listId: updatedCard.list,
+            labels: updatedCard.labels,
+            dueDate: updatedCard.dueDate
         });
     } catch (error) {
         res.status(500).json({ message: error.message });
@@ -199,10 +249,54 @@ router.delete('/cards/:cardId', protect, async (req, res) => {
     try {
         const card = await Card.findById(req.params.cardId);
         if (card) {
+            const list = await List.findById(card.list);
             await List.findByIdAndUpdate(card.list, { $pull: { cards: req.params.cardId } });
             await Card.findByIdAndDelete(req.params.cardId);
+            await createAuditLog('delete', 'Card', req.params.cardId, req.user.id, list.board, {
+                title: card.title
+            });
         }
         res.json({ message: 'Card deleted' });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
+
+// Filter cards
+router.get('/:id/cards/filter', protect, async (req, res) => {
+    const { labels, dueDateFrom, dueDateTo } = req.query;
+    const boardId = req.params.id;
+
+    try {
+        const board = await Board.findById(boardId).populate('lists');
+        if (!board) return res.status(404).json({ message: 'Board not found' });
+
+        const listIds = board.lists.map(l => l._id);
+
+        let query = { list: { $in: listIds } };
+
+        if (labels) {
+            const labelArray = labels.split(',');
+            query['labels.name'] = { $in: labelArray };
+        }
+
+        if (dueDateFrom || dueDateTo) {
+            query.dueDate = {};
+            if (dueDateFrom) query.dueDate.$gte = new Date(dueDateFrom);
+            if (dueDateTo) query.dueDate.$lte = new Date(dueDateTo);
+        }
+
+        const cards = await Card.find(query).populate('list').populate('creator');
+
+        res.json(cards.map(c => ({
+            id: c._id,
+            title: c.title,
+            description: c.description,
+            labels: c.labels,
+            dueDate: c.dueDate,
+            listId: c.list._id,
+            listName: c.list.title
+        })));
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
@@ -211,15 +305,21 @@ router.delete('/cards/:cardId', protect, async (req, res) => {
 // Invite Member
 router.post('/:id/invite', protect, async (req, res) => {
     const { email } = req.body;
+    const boardId = req.params.id;
+
     try {
         const userToInvite = await User.findOne({ email });
         if (!userToInvite) return res.status(404).json({ message: 'User not found' });
 
-        await Board.findByIdAndUpdate(req.params.id, {
+        const board = await Board.findByIdAndUpdate(boardId, {
             $addToSet: { members: userToInvite._id }
+        }, { new: true }).populate('members', 'name email');
+
+        await createAuditLog('invite', 'Member', userToInvite._id, req.user.id, boardId, {
+            email: userToInvite.email
         });
 
-        res.json({ message: 'User invited' });
+        res.json({ message: 'User invited', members: board.members });
     } catch (error) {
         res.status(500).json({ message: error.message });
     }
@@ -230,10 +330,12 @@ router.delete('/lists/:listId', protect, async (req, res) => {
     try {
         const list = await List.findById(req.params.listId);
         if (list) {
-            // Delete all cards in list
             await Card.deleteMany({ list: req.params.listId });
             await Board.findByIdAndUpdate(list.board, { $pull: { lists: req.params.listId } });
             await List.findByIdAndDelete(req.params.listId);
+            await createAuditLog('delete', 'List', req.params.listId, req.user.id, list.board, {
+                title: list.title
+            });
         }
         res.json({ message: 'List deleted' });
     } catch (error) {
@@ -241,5 +343,49 @@ router.delete('/lists/:listId', protect, async (req, res) => {
     }
 });
 
+// Get audit logs for a board (paginated)
+router.get('/:id/audit-logs', protect, async (req, res) => {
+    const { page = 1, limit = 20 } = req.query;
+    const boardId = req.params.id;
+
+    try {
+        const board = await Board.findById(boardId);
+        if (!board) return res.status(404).json({ message: 'Board not found' });
+
+        const isMember = board.members.some(m => m._id.toString() === req.user.id);
+        const isOwner = board.owner.toString() === req.user.id;
+        if (!isMember && !isOwner) return res.status(403).json({ message: 'Not authorized' });
+
+        const skip = (parseInt(page) - 1) * parseInt(limit);
+
+        const logs = await AuditLog.find({ board: boardId })
+            .populate('user', 'name email')
+            .sort({ timestamp: -1 })
+            .limit(parseInt(limit))
+            .skip(skip);
+
+        const total = await AuditLog.countDocuments({ board: boardId });
+
+        res.json({
+            logs: logs.map(log => ({
+                id: log._id,
+                action: log.action,
+                entityType: log.entityType,
+                entityId: log.entityId,
+                user: log.user,
+                metadata: log.metadata,
+                timestamp: log.timestamp
+            })),
+            pagination: {
+                page: parseInt(page),
+                limit: parseInt(limit),
+                total,
+                pages: Math.ceil(total / parseInt(limit))
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ message: error.message });
+    }
+});
 
 module.exports = router;

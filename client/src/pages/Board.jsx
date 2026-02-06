@@ -1,7 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import api from '../utils/api';
 import Column from '../components/Board/Column';
+import AuditLogView from '../components/Board/AuditLogView';
+import InviteMemberModal from '../components/Board/InviteMemberModal';
+import CardDetailModal from '../components/Board/CardDetailModal';
+import BoardFilter from '../components/Board/BoardFilter';
 import {
     DndContext,
     closestCorners,
@@ -10,38 +14,71 @@ import {
     useSensor,
     useSensors
 } from '@dnd-kit/core';
-import { arrayMove } from '@dnd-kit/sortable';
-import { Loader2, Plus, ArrowLeft } from 'lucide-react';
+import { arrayMove, SortableContext, horizontalListSortingStrategy } from '@dnd-kit/sortable';
+import { Loader2, Plus, ArrowLeft, Users, History, Share2 } from 'lucide-react';
 import TaskCard from '../components/Board/TaskCard';
 
 export default function Board() {
     const { id } = useParams();
     const [board, setBoard] = useState(null);
-    const [lists, setLists] = useState([]); // Local state for immediate UI updates
+    const [lists, setLists] = useState([]);
     const [newListTitle, setNewListTitle] = useState("");
     const [activeCard, setActiveCard] = useState(null);
+    const [activeList, setActiveList] = useState(null);
+
+    // UI States
+    const [showInviteModal, setShowInviteModal] = useState(false);
+    const [showLogView, setShowLogView] = useState(false);
+    const [selectedCard, setSelectedCard] = useState(null);
+    const [filters, setFilters] = useState({ labels: [], dueDateFrom: '', dueDateTo: '' });
+    const [loading, setLoading] = useState(true);
 
     const sensors = useSensors(
-        useSensor(PointerSensor, {
-            activationConstraint: {
-                distance: 5,
-            },
-        })
+        useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
     );
 
-    useEffect(() => {
-        fetchBoard();
-    }, [id]);
-
-    const fetchBoard = async () => {
+    const fetchBoard = useCallback(async () => {
         try {
+            setLoading(true);
             const { data } = await api.get(`/boards/${id}`);
             setBoard(data);
             setLists(data.lists);
         } catch (err) {
             console.error(err);
+        } finally {
+            setLoading(false);
         }
-    };
+    }, [id]);
+
+    useEffect(() => {
+        fetchBoard();
+    }, [fetchBoard]);
+
+    // Combined local filtering for responsive UI
+    const filteredLists = useMemo(() => {
+        const hasLabelFilter = filters.labels?.length > 0;
+        const hasDateFromFilter = !!filters.dueDateFrom;
+        const hasDateToFilter = !!filters.dueDateTo;
+
+        if (!hasLabelFilter && !hasDateFromFilter && !hasDateToFilter) return lists;
+
+        return lists.map(list => ({
+            ...list,
+            cards: list.cards.filter(card => {
+                let matches = true;
+                if (hasLabelFilter) {
+                    matches = card.labels?.some(l => filters.labels.includes(l.name));
+                }
+                if (matches && hasDateFromFilter) {
+                    matches = card.dueDate && new Date(card.dueDate) >= new Date(filters.dueDateFrom);
+                }
+                if (matches && hasDateToFilter) {
+                    matches = card.dueDate && new Date(card.dueDate) <= new Date(filters.dueDateTo);
+                }
+                return matches;
+            })
+        }));
+    }, [lists, filters]);
 
     const addList = async (e) => {
         e.preventDefault();
@@ -56,9 +93,9 @@ export default function Board() {
     };
 
     const deleteList = async (listId) => {
-        if (!confirm("Are you sure?")) return;
+        if (!confirm("Are you sure you want to delete this list and all its cards?")) return;
         try {
-            await api.delete(`/boards/${id}/lists/${listId}`);
+            await api.delete(`/boards/lists/${listId}`);
             setLists(lists.filter(l => l.id !== listId));
         } catch (err) {
             console.error(err);
@@ -67,27 +104,24 @@ export default function Board() {
 
     const addCard = async (listId, title) => {
         try {
-            const { data } = await api.post(`/boards/${id}/lists/${listId}/cards`, { title, order: 0 });
-            // Update local state
-            const newLists = lists.map(list => {
-                if (list.id === listId) {
-                    return { ...list, cards: [...list.cards, data] };
-                }
-                return list;
-            });
-            setLists(newLists);
+            const { data } = await api.post(`/boards/${id}/lists/${listId}/cards`, { title });
+            setLists(prev => prev.map(l => l.id === listId ? { ...l, cards: [...l.cards, data] } : l));
         } catch (err) {
             console.error(err);
         }
     };
 
+    const updateCard = async (updatedCard) => {
+        setLists(prev => prev.map(l => ({
+            ...l,
+            cards: l.cards.map(c => c.id === updatedCard.id ? updatedCard : c)
+        })));
+    };
+
     const deleteCard = async (cardId) => {
         try {
-            await api.delete(`/boards/${id}/cards/${cardId}`);
-            const newLists = lists.map(list => {
-                return { ...list, cards: list.cards.filter(c => c.id !== cardId) };
-            });
-            setLists(newLists);
+            await api.delete(`/boards/cards/${cardId}`);
+            setLists(prev => prev.map(l => ({ ...l, cards: l.cards.filter(c => c.id !== cardId) })));
         } catch (err) {
             console.error(err);
         }
@@ -95,70 +129,42 @@ export default function Board() {
 
     const handleDragStart = (event) => {
         const { active } = event;
-        const cardId = active.id;
-        // Find card
-        let foundCard = null;
-        for (const list of lists) {
-            const c = list.cards.find(c => c.id === cardId);
-            if (c) {
-                foundCard = c;
-                break;
-            }
+        if (active.data.current?.type === 'Column') {
+            setActiveList(active.data.current.list);
+        } else {
+            setActiveCard(active.data.current.card);
         }
-        setActiveCard(foundCard);
     };
 
     const handleDragOver = (event) => {
         const { active, over } = event;
-        if (!over) return;
+        if (!over || active.data.current?.type === 'Column') return;
 
         const activeId = active.id;
         const overId = over.id;
 
-        // Find containers
-        const findContainer = (id) => {
-            const list = lists.find(l => l.id === id);
-            if (list) return list.id;
-            const listWithCard = lists.find(l => l.cards.some(c => c.id === id));
-            return listWithCard ? listWithCard.id : null;
-        };
+        const activeContainer = active.data.current?.sortable?.containerId;
+        const overContainer = over.data.current?.sortable?.containerId || overId;
 
-        const activeContainer = findContainer(activeId);
-        const overContainer = findContainer(overId);
+        if (activeContainer === overContainer) return;
 
-        if (!activeContainer || !overContainer || activeContainer === overContainer) {
-            return;
-        }
-
-        // Move to another list visualy during drag
         setLists((prev) => {
             const activeListIndex = prev.findIndex(l => l.id === activeContainer);
             const overListIndex = prev.findIndex(l => l.id === overContainer);
 
             const newLists = [...prev];
-            const activeList = { ...newLists[activeListIndex] };
-            const overList = { ...newLists[overListIndex] };
+            if (activeListIndex === -1 || overListIndex === -1) return prev;
 
-            // Remove from active
+            const activeList = { ...newLists[activeListIndex], cards: [...newLists[activeListIndex].cards] };
+            const overList = { ...newLists[overListIndex], cards: [...newLists[overListIndex].cards] };
+
             const cardIndex = activeList.cards.findIndex(c => c.id === activeId);
             const [movedCard] = activeList.cards.splice(cardIndex, 1);
 
-            // Add to over
-            // If over matches a card id, insert near it. If it matches list id, push to end.
-            const isOverList = over.data.current?.type !== 'Card';
-            if (isOverList) {
-                overList.cards.push(movedCard);
-            } else {
-                // Find index of over card
-                const overCardIndex = overList.cards.findIndex(c => c.id === overId);
-                const isBelowOverItem = over &&
-                    active.rect.current.translated &&
-                    active.rect.current.translated.top > over.rect.top + over.rect.height;
-
-                const modifier = isBelowOverItem ? 1 : 0;
-                const newIndex = overCardIndex >= 0 ? overCardIndex + modifier : overList.cards.length + 1;
-                overList.cards.splice(newIndex, 0, movedCard);
-            }
+            // Add to new list
+            const overCardIndex = overList.cards.findIndex(c => c.id === overId);
+            const newIndex = overCardIndex >= 0 ? overCardIndex : overList.cards.length;
+            overList.cards.splice(newIndex, 0, { ...movedCard, listId: overContainer });
 
             newLists[activeListIndex] = activeList;
             newLists[overListIndex] = overList;
@@ -170,88 +176,70 @@ export default function Board() {
     const handleDragEnd = async (event) => {
         const { active, over } = event;
         setActiveCard(null);
+        setActiveList(null);
 
-        // If dropped nowhere
         if (!over) return;
 
+        // Handle List Reordering
+        if (active.data.current?.type === 'Column') {
+            const activeIndex = lists.findIndex(l => l.id === active.id);
+            const overIndex = lists.findIndex(l => l.id === over.id);
+
+            if (activeIndex !== overIndex) {
+                const newLists = arrayMove(lists, activeIndex, overIndex);
+                setLists(newLists);
+
+                // Sync with backend
+                const listOrders = newLists.map((l, idx) => ({ listId: l.id, order: idx * 100 }));
+                await api.put(`/boards/${id}/lists/reorder`, { listOrders });
+            }
+            return;
+        }
+
+        // Handle Card reordering/move
         const activeId = active.id;
         const overId = over.id;
 
-        // Persist change
-        // We need to identify the new list and new index
-        // We can rely on the `lists` state which DragOver kept updated mostly? 
-        // Actually DragOver updates are transient if we don't save. 
-        // But `setLists` updates stat, so we just need to send API call
-
-        // Find the card in the *current* state (post-drag-over)
-        let finalListId = null;
-        let finalOrder = 0;
-
-        // Scan lists to find where the card ended up
-        // Wait, DragOver handles "between lists".
-        // DragEnd handles "within same list" reordering if not covered.
-
-        // Re-scanning lists
-        // Note: This needs robust logic. For MVP speed, let's just find the card's new parent and neighbors.
-
-        // Ideally we use arrayMove for same container
-        // And move logic for different container
-
-        // Let's simplified: just trigger API update based on final state
-        // But we need to know what the final state IS from the `lists` object, because `handleDragOver` mutated it?
-        // standard dnd-kit `handleDragOver` updates state.
-        // So `lists` IS the source of truth for UI.
-        // We just need to sync backend.
-
-        // Find card
+        let targetList = null;
         let card = null;
-        let listId = null;
         let index = -1;
 
         lists.forEach(l => {
             const idx = l.cards.findIndex(c => c.id === activeId);
             if (idx !== -1) {
                 card = l.cards[idx];
-                listId = l.id;
+                targetList = l;
                 index = idx;
             }
         });
 
-        if (card && listId) {
-            // Calculate naive order
-            // In real app, we check neighbors' order
-            // items: [ {order: 100}, {order: 200} ]
-            // if index 0, order = next.order / 2 or next.order - 100
-            // if index last, order = prev.order + 100
-            // if middle, (prev + next) / 2
-
-            const targetList = lists.find(l => l.id === listId);
+        if (card && targetList) {
+            let newOrder = 100;
             const cards = targetList.cards;
-            let newOrder = 0;
 
-            if (cards.length === 1) {
-                newOrder = 100;
-            } else if (index === 0) {
-                newOrder = cards[1].order / 2;
-            } else if (index === cards.length - 1) {
-                newOrder = cards[index - 1].order + 100;
-            } else {
-                const prev = cards[index - 1].order;
-                const next = cards[index + 1].order;
-                newOrder = (prev + next) / 2;
+            if (cards.length > 1) {
+                if (index === 0) {
+                    newOrder = cards[1].order / 2;
+                } else if (index === cards.length - 1) {
+                    newOrder = cards[index - 1].order + 100;
+                } else {
+                    newOrder = (cards[index - 1].order + cards[index + 1].order) / 2;
+                }
             }
 
-            // Optimistic update
-            // We already have UI update.
-            // Send API
-            await api.put(`/boards/${id}/cards/${activeId}`, {
-                listId,
+            await api.put(`/boards/cards/${activeId}`, {
+                listId: targetList.id,
                 order: newOrder
             });
         }
     };
 
-    if (!board) return <div className="flex justify-center items-center h-screen"><Loader2 className="animate-spin" /></div>;
+    if (loading) return (
+        <div className="flex flex-col justify-center items-center h-screen bg-blue-50 space-y-4">
+            <Loader2 className="animate-spin text-blue-600" size={48} />
+            <span className="text-blue-600 font-bold tracking-widest animate-pulse">Loading Board...</span>
+        </div>
+    );
 
     return (
         <DndContext
@@ -262,62 +250,118 @@ export default function Board() {
             onDragEnd={handleDragEnd}
         >
             <div
-                className="h-screen flex flex-col bg-blue-500"
-                style={{ backgroundImage: 'url(https://images.unsplash.com/photo-1542435503-956c469947f6?auto=format&fit=crop&q=80)', backgroundSize: 'cover' }}
+                className="h-screen flex flex-col transition-all duration-700 overflow-hidden"
+                style={{
+                    backgroundImage: 'linear-gradient(rgba(0,0,0,0.3), rgba(0,0,0,0.3)), url(https://images.unsplash.com/photo-1497215728101-856f4ea42174?auto=format&fit=crop&q=80)',
+                    backgroundSize: 'cover',
+                    backgroundPosition: 'center'
+                }}
             >
-                {/* Header */}
-                <div className="bg-black/30 backdrop-blur-sm p-4 text-white flex justify-between items-center shadow">
-                    <div className="flex items-center gap-4">
-                        <Link to="/" className="hover:bg-white/20 p-2 rounded"><ArrowLeft size={20} /></Link>
-                        <h1 className="font-bold text-lg">{board.title}</h1>
-                    </div>
-                    <div className="flex gap-2">
-                        {/* Invite Button could go here */}
-                        <div className="flex -space-x-2">
-                            {board.members.map(m => (
-                                <div key={m.id} className="w-8 h-8 rounded-full bg-white text-blue-800 flex items-center justify-center font-bold text-xs border-2 border-transparent" title={m.name}>
-                                    {m.name.charAt(0)}
-                                </div>
-                            ))}
-                            <div className="w-8 h-8 rounded-full bg-gray-300 text-gray-700 flex items-center justify-center text-xs border-2 border-white" title="Owner">
-                                {board.owner.name.charAt(0)}
-                            </div>
+                {/* Modern Transparent Header */}
+                <header className="backdrop-blur-md bg-black/40 p-4 text-white flex justify-between items-center border-b border-white/10 shadow-2xl relative z-40">
+                    <div className="flex items-center gap-6">
+                        <Link to="/" className="hover:bg-white/20 p-2 rounded-xl transition-all"><ArrowLeft size={20} /></Link>
+                        <div className="flex flex-col">
+                            <h1 className="font-extrabold text-xl tracking-tight">{board.title}</h1>
+                            <span className="text-[10px] text-white/60 uppercase font-bold tracking-widest">Team Board</span>
                         </div>
                     </div>
-                </div>
 
-                {/* Board Canvas */}
-                <div className="flex-1 overflow-x-auto overflow-y-hidden p-6">
-                    <div className="flex gap-4 h-full items-start">
+                    <div className="flex items-center gap-4">
+                        <BoardFilter activeFilters={filters} onFilterChange={setFilters} />
 
-                        {lists.map(list => (
-                            <Column
-                                key={list.id}
-                                list={list}
-                                cards={list.cards}
-                                onDeleteList={deleteList}
-                                onAddCard={addCard}
-                                onDeleteCard={deleteCard}
-                            />
-                        ))}
+                        <div className="h-6 w-[1px] bg-white/10 mx-2" />
 
-                        {/* Add List Button */}
+                        <div className="flex items-center gap-2">
+                            <div className="flex -space-x-3 pr-2">
+                                <div className="w-8 h-8 rounded-full bg-blue-500 border-2 border-white/20 flex items-center justify-center font-bold text-xs shadow-lg" title={`Owner: ${board.owner.name}`}>
+                                    {board.owner.name.charAt(0)}
+                                </div>
+                                {board.members.map(m => (
+                                    <div key={m._id} className="w-8 h-8 rounded-full bg-indigo-500 border-2 border-white/20 flex items-center justify-center font-bold text-xs shadow-lg" title={m.name}>
+                                        {m.name.charAt(0)}
+                                    </div>
+                                ))}
+                            </div>
+                            <button
+                                onClick={() => setShowInviteModal(true)}
+                                className="bg-white/10 hover:bg-white/20 p-2 rounded-lg transition-all text-white flex items-center gap-2 text-xs font-bold"
+                            >
+                                <Share2 size={16} />
+                                Invite
+                            </button>
+                            <button
+                                onClick={() => setShowLogView(!showLogView)}
+                                className={`p-2 rounded-lg transition-all ${showLogView ? 'bg-blue-600' : 'bg-white/10 hover:bg-white/20'}`}
+                                title="View Activity"
+                            >
+                                <History size={16} />
+                            </button>
+                        </div>
+                    </div>
+                </header>
+
+                {/* Board Body */}
+                <main className="flex-1 overflow-x-auto overflow-y-hidden p-8 scroll-smooth custom-scrollbar">
+                    <div className="flex gap-6 h-full items-start">
+                        <SortableContext items={filteredLists.map(l => l.id)} strategy={horizontalListSortingStrategy}>
+                            {filteredLists.map(list => (
+                                <Column
+                                    key={list.id}
+                                    list={list}
+                                    cards={list.cards}
+                                    onDeleteList={deleteList}
+                                    onAddCard={addCard}
+                                    onCardClick={setSelectedCard}
+                                    onDeleteCard={deleteCard}
+                                />
+                            ))}
+                        </SortableContext>
+
+                        {/* Add List Trigger */}
                         <div className="w-72 flex-shrink-0">
-                            <form onSubmit={addList} className="bg-white/20 backdrop-blur-md p-3 rounded-lg hover:bg-white/30 transition">
+                            <form onSubmit={addList} className="bg-white/10 backdrop-blur-md p-3 rounded-xl hover:bg-white/20 transition-all border border-white/10 group shadow-lg">
                                 <input
-                                    className="w-full p-2 text-sm rounded border-none focus:ring-2 ring-blue-500 bg-white/90"
+                                    className="w-full p-2 bg-transparent text-white placeholder-white/50 text-sm border-none focus:ring-0 outline-none"
                                     placeholder="+ Add another list"
                                     value={newListTitle}
                                     onChange={(e) => setNewListTitle(e.target.value)}
                                 />
-                                {newListTitle && <button className="mt-2 bg-blue-600 text-white px-3 py-1 rounded text-sm w-full">Add List</button>}
+                                {newListTitle && (
+                                    <button className="mt-2 bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg text-xs w-full transition-all shadow-md">
+                                        Add List
+                                    </button>
+                                )}
                             </form>
                         </div>
                     </div>
-                </div>
+                </main>
 
-                <DragOverlay>
+                {/* Modals & Overlays */}
+                {showLogView && (
+                    <AuditLogView boardId={id} onClose={() => setShowLogView(false)} />
+                )}
+
+                {showInviteModal && (
+                    <InviteMemberModal
+                        boardId={id}
+                        onClose={() => setShowInviteModal(false)}
+                        onInvite={(members) => setBoard({ ...board, members })}
+                    />
+                )}
+
+                {selectedCard && (
+                    <CardDetailModal
+                        card={selectedCard}
+                        onClose={() => setSelectedCard(null)}
+                        onUpdate={updateCard}
+                        onDelete={deleteCard}
+                    />
+                )}
+
+                <DragOverlay adjustScale={false}>
                     {activeCard ? <TaskCard card={activeCard} /> : null}
+                    {activeList ? <Column list={activeList} cards={activeList.cards} /> : null}
                 </DragOverlay>
             </div>
         </DndContext>
